@@ -59,7 +59,7 @@
 
 ```
 hand-particles/
-├── hand-particles.html   # 完整应用（HTML + CSS + JS 单文件）
+├── index.html   # 完整应用（HTML + CSS + JS 单文件）
 └── README.md
 ```
 
