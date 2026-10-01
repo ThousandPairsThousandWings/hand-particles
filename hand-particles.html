@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>手势粒子动画 - Hand Particles</title>
+<!-- MediaPipe 手部追踪 -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<style>
+    html, body {
+        margin: 0; padding: 0;
+        width: 100%; height: 100%;
+        overflow: hidden; background: #000;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+    #input_video { display: none; }
+    #output_canvas { position: fixed; top: 0; left: 0; }
+
+    /* 底部状态栏 */
+    #status {
+        position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%);
+        z-index: 20; padding: 10px 26px;
+        background: rgba(0, 0, 0, 0.65); backdrop-filter: blur(10px);
+        border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 24px;
+        color: #fff; font-size: 13px; text-align: center;
+        pointer-events: none; min-width: 340px; line-height: 1.6;
+    }
+    #status .sub { font-size: 12px; opacity: 0.7; }
+
+    /* 右下角动画选择器 */
+    #selector {
+        position: fixed; right: 24px; bottom: 24px; z-index: 30;
+        width: 190px; user-select: none; font-size: 15px;
+    }
+    #selector-btn {
+        background: rgba(13, 22, 38, 0.92); color: #e8f4ff;
+        padding: 10px 14px; border: 1px solid rgba(140, 200, 255, 0.25);
+        border-radius: 6px; cursor: pointer;
+        display: flex; justify-content: space-between; align-items: center;
+    }
+    #selector-btn .arrow { font-size: 12px; opacity: 0.8; transition: transform 0.2s; }
+    #selector.open .arrow { transform: rotate(180deg); }
+    #selector-list {
+        display: none; margin-top: 4px; padding: 0;
+        background: rgba(13, 22, 38, 0.94);
+        border: 1px solid rgba(140, 200, 255, 0.25);
+        border-radius: 6px; overflow: hidden;
+    }
+    #selector.open #selector-list { display: block; }
+    #selector-list li {
+        list-style: none; padding: 9px 14px; color: #dcecff; cursor: pointer;
+    }
+    #selector-list li:hover { background: rgba(90, 140, 200, 0.35); }
+    #selector-list li.active { background: rgba(125, 135, 155, 0.55); }
+</style>
+</head>
+<body>
+
+<video id="input_video" playsinline muted></video>
+<canvas id="output_canvas"></canvas>
+
+<div id="status">正在初始化摄像头...</div>
+
+<div id="selector">
+    <div id="selector-btn"><span id="selector-label">球体</span><span class="arrow">▼</span></div>
+    <ul id="selector-list"></ul>
+</div>
+
+<script>
+/* ================= 基础设置 ================= */
+const videoEl   = document.getElementById('input_video');
+const canvas    = document.getElementById('output_canvas');
+const ctx       = canvas.getContext('2d');
+const statusEl  = document.getElementById('status');
+const selector  = document.getElementById('selector');
+const labelEl   = document.getElementById('selector-label');
+const listEl    = document.getElementById('selector-list');
+
+const TAU = Math.PI * 2;
+const rand  = (a = 1, b) => b === undefined ? Math.random() * a : a + Math.random() * (b - a);
+const gauss = () => (Math.random() + Math.random() + Math.random() - 1.5) / 1.5; // 近似正态 [-1,1]
+
+let cw = 0, ch = 0, dpr = 1;
+function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    cw = window.innerWidth; ch = window.innerHeight;
+    canvas.width = cw * dpr; canvas.height = ch * dpr;
+    canvas.style.width = cw + 'px'; canvas.style.height = ch + 'px';
+}
+window.addEventListener('resize', resize);
+resize();
+
+// 预渲染圆形光晕精灵（径向渐变，供所有粒子复用）
+const GLOW = 64;
+const glowSprite = document.createElement('canvas');
+glowSprite.width = GLOW; glowSprite.height = GLOW;
+{
+    const g = glowSprite.getContext('2d');
+    const grad = g.createRadialGradient(GLOW / 2, GLOW / 2, 0, GLOW / 2, GLOW / 2, GLOW / 2);
+    // 多档渐变：亮核 → 缓慢衰减 → 极淡边缘，形成柔和的圆形扩散
+    grad.addColorStop(0, 'rgba(235,248,255,0.9)');
+    grad.addColorStop(0.2, 'rgba(210,235,255,0.45)');
+    grad.addColorStop(0.45, 'rgba(180,220,255,0.18)');
+    grad.addColorStop(0.75, 'rgba(160,210,255,0.05)');
+    grad.addColorStop(1, 'rgba(160,210,255,0)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, GLOW, GLOW);
+}
+
+// 柔和扩散精灵：无亮核、衰减极缓的纯弥散光雾
+const diffuseSprite = document.createElement('canvas');
+diffuseSprite.width = GLOW; diffuseSprite.height = GLOW;
+{
+    const g = diffuseSprite.getContext('2d');
+    const grad = g.createRadialGradient(GLOW / 2, GLOW / 2, 0, GLOW / 2, GLOW / 2, GLOW / 2);
+    grad.addColorStop(0, 'rgba(220,240,255,0.55)');
+    grad.addColorStop(0.35, 'rgba(200,230,255,0.28)');
+    grad.addColorStop(0.7, 'rgba(180,215,255,0.08)');
+    grad.addColorStop(1, 'rgba(160,210,255,0)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, GLOW, GLOW);
+}
+
+/* ================= 六种粒子动画定义 ================= */
+const ANIMS = [
+    {
+        name: '球体', tilt: 0.35, rotSpeed: 0.45, fit: 1.0,
+        gen() {
+            this.pts = []; this.lines = null;
+            const N = 3000, ga = Math.PI * (3 - Math.sqrt(5)); // 斐波那契均匀分布
+            for (let i = 0; i < N; i++) {
+                const y = 1 - 2 * i / (N - 1);
+                const r = Math.sqrt(Math.max(0, 1 - y * y));
+                const th = ga * i;
+                const shell = Math.random() < 0.85 ? (0.94 + rand(0.1)) : Math.cbrt(rand(1)) * 0.85;
+                this.pts.push({
+                    x: Math.cos(th) * r * shell, y: y * shell, z: Math.sin(th) * r * shell,
+                    s: rand(1), tw: rand(TAU)
+                });
+            }
+        }
+    },
+    {
+        name: '光环', tilt: 1.05, rotSpeed: 0.5, fit: 1.0,
+        gen() {
+            this.pts = []; this.lines = null;
+            const N = 3000, R = 0.82, tr = 0.09;
+            for (let i = 0; i < N; i++) {
+                const u = rand(TAU), v = rand(TAU);
+                const rEff = tr * (0.4 + 0.6 * rand(1)) + gauss() * 0.015;
+                let x = (R + rEff * Math.cos(v)) * Math.cos(u);
+                let z = (R + rEff * Math.cos(v)) * Math.sin(u);
+                let y = rEff * Math.sin(v);
+                if (Math.random() < 0.12) { // 少量尘埃散布在环内外
+                    const rr = R * (0.72 + rand(0.55));
+                    x = Math.cos(u) * rr; z = Math.sin(u) * rr; y = gauss() * 0.08;
+                }
+                this.pts.push({ x, y, z, s: rand(1), tw: rand(TAU) });
+            }
+        }
+    },
+    {
+        name: '螺旋', tilt: 0.10, rotSpeed: 0.15, fit: 0.92,
+        gen() {
+            this.pts = []; this.lines = null;
+            const N = 3200, turns = 5.4;
+            for (let i = 0; i < N; i++) {
+                const t = rand(1); // 0=顶部 1=底部
+                this.pts.push({
+                    a: t * turns * TAU + gauss() * 0.28,      // 螺旋臂相位
+                    av: 1.5 + gauss() * 0.2,                  // 自转角速度
+                    r: (1.0 - t * 0.78) * (1 + gauss() * 0.035), // 上宽下窄
+                    y: (0.5 - t) * 1.9 + gauss() * 0.02,
+                    s: rand(1), tw: rand(TAU)
+                });
+            }
+        },
+        frame(p, dt) {
+            p.a += p.av * dt;
+            p.x = Math.cos(p.a) * p.r;
+            p.z = Math.sin(p.a) * p.r;
+        }
+    },
+    {
+        name: '波场', tilt: 0.95, rotSpeed: 0, fit: 1.0,
+        gen() {
+            this.pts = []; this.lines = null;
+            const cols = 60, rows = 38;
+            for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+                this.pts.push({
+                    x0: (c / (cols - 1) - 0.5) * 2.7,
+                    z0: (r / (rows - 1) - 0.5) * 1.8,
+                    s: rand(1), tw: rand(TAU)
+                });
+            }
+        },
+        frame(p, dt, time) {
+            p.x = p.x0; p.z = p.z0;
+            p.y = Math.sin(p.x0 * 2.0 + time * 1.7) * Math.cos(p.z0 * 2.4 + time * 1.15) * 0.22
+                + Math.sin(p.x0 * 4.1 - time * 0.9) * 0.05;
+        }
+    },
+    {
+        name: '星座', tilt: 0.25, rotSpeed: 0.28, fit: 1.0,
+        gen() {
+            this.pts = []; this.lines = [];
+            const N = 150;
+            for (let i = 0; i < N; i++) {
+                this.pts.push({
+                    x: gauss() * 1.1, y: gauss() * 0.75, z: gauss() * 0.7,
+                    s: rand(1), tw: rand(TAU), star: Math.random() < 0.2
+                });
+            }
+            const MAXD = 0.62;
+            for (let i = 0; i < N; i++) for (let j = i + 1; j < N; j++) {
+                const a = this.pts[i], b = this.pts[j];
+                if (Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) < MAXD) this.lines.push([i, j]);
+            }
+        }
+    },
+    {
+        name: '星图', tilt: 0, rotSpeed: 0, fit: 1.35,
+        gen() {
+            // 星座连线图：按参考图（554×302）的星点位置与连接方式还原
+            // s = 星点在参考图中的像素坐标，e = 连线（星点索引对）
+            const G = [
+                { s: [[58,38],[92,26],[120,40],[98,64],[62,60]],                               e: [[0,1],[1,2],[2,3],[3,4],[4,0]] },
+                { s: [[88,105],[122,88],[152,78],[140,110],[106,124]],                         e: [[0,1],[1,2],[2,3],[3,4],[4,0]] },
+                { s: [[232,60],[262,42],[286,62],[266,90],[238,86],[258,112]],                 e: [[0,1],[1,2],[2,3],[3,0],[3,4],[4,0],[3,5]] },
+                { s: [[332,30],[358,50],[382,32],[372,72],[342,80]],                           e: [[0,1],[1,2],[1,3],[3,4]] },
+                { s: [[438,95],[462,106],[486,120],[500,146],[492,172],[468,183],[446,170]],   e: [[0,1],[1,2],[2,3],[3,4],[4,5],[5,6]] },
+                { s: [[506,100],[522,126],[524,156],[508,181],[486,192]],                      e: [[0,1],[1,2],[2,3],[3,4]] },
+                { s: [[42,158],[70,148],[90,172],[60,184]],                                    e: [[0,1],[1,2],[2,3],[3,0]] },
+                { s: [[186,152],[216,138],[246,150],[228,182],[196,186]],                      e: [[0,1],[1,2],[2,3],[3,4],[4,0]] },
+                { s: [[150,206],[176,228],[148,242]],                                          e: [[0,1],[1,2],[2,0]] },
+                { s: [[282,196],[310,182],[332,206],[312,234],[284,226]],                      e: [[0,1],[1,2],[2,3],[3,4],[4,0]] },
+                { s: [[62,242],[92,228],[120,248],[96,270],[64,274]],                          e: [[0,1],[1,2],[2,3],[3,4],[4,0],[1,3]] },
+                { s: [[352,204],[368,232],[382,258],[396,286],[336,228]],                      e: [[0,1],[1,2],[2,3],[0,4]] },
+                { s: [[442,236],[472,227],[496,250],[462,263],[446,287]],                      e: [[0,1],[1,2],[2,3],[3,0],[2,4]] }
+            ];
+            this.pts = []; this.lines = [];
+            for (const g of G) {
+                const base = this.pts.length;
+                for (const [sx, sy] of g.s) {
+                    this.pts.push({
+                        x: (sx / 554 - 0.5) * 3.6,          // 图片像素坐标 → 世界坐标（保持原图比例与方位）
+                        y: (0.5 - sy / 302) * 1.96,
+                        z: 0,
+                        s: 0.55 + Math.random() * 0.45, tw: rand(TAU), star: true
+                    });
+                }
+                for (const [a, b] of g.e) this.lines.push([base + a, base + b]);
+            }
+            // 背景星空：银河尘埃带（中央密集）+ 全天散布的暗星
+            for (let i = 0; i < 900; i++) {
+                this.pts.push({
+                    x: rand(-1.8, 1.8), y: gauss() * 0.38, z: 0,
+                    s: Math.random() * 0.5, tw: rand(TAU), star: false
+                });
+            }
+            for (let i = 0; i < 500; i++) {
+                this.pts.push({
+                    x: rand(-1.8, 1.8), y: rand(-0.98, 0.98), z: 0,
+                    s: Math.random() * 0.5, tw: rand(TAU), star: false
+                });
+            }
+        }
+    }
+];
+
+let current = 0;
+let switchTime = 0;
+let animScale = 1, targetScale = 1;
+
+function setAnim(i) {
+    current = i;
+    ANIMS[i].gen();
+    switchTime = performance.now();
+    labelEl.textContent = ANIMS[i].name;
+    listEl.querySelectorAll('li').forEach((li, k) => li.classList.toggle('active', k === i));
+}
+
+// 构建右下角选择器
+ANIMS.forEach((a, i) => {
+    const li = document.createElement('li');
+    li.textContent = a.name;
+    li.addEventListener('click', e => { e.stopPropagation(); setAnim(i); selector.classList.remove('open'); });
+    listEl.appendChild(li);
+});
+document.getElementById('selector-btn').addEventListener('click', () => selector.classList.toggle('open'));
+document.addEventListener('click', () => selector.classList.remove('open'));
+selector.addEventListener('click', e => e.stopPropagation());
+
+/* ================= 手部追踪与手势识别 ================= */
+let latest = null;          // 最新的 21 个手部关键点
+let lastSeen = 0;           // 最后一次看到手的时间
+let handSmoothed = null;    // 平滑后的屏幕坐标
+let camReady = false;
+
+let xHist = [];             // 手掌中心 x 历史（用于摇晃检测）
+let lastSwitch = 0;
+let flashMsg = '', flashUntil = 0;
+
+// 视角控制（捏合拖动，增量式：拖多少转多少）
+let pinching = false, prevNx = 0, prevNy = 0;
+let userYaw = 0, userTilt = 0, userYawTarget = 0, userTiltTarget = 0;
+let centerOffX = 0, centerOffY = 0, centerTX = 0, centerTY = 0;
+
+// 手掌中心水平摇晃检测：统计窗口内的方向反转次数
+function countReversals(hist, amp) {
+    if (hist.length < 3) return 0;
+    let dir = 0, ext = hist[0], rev = 0;
+    for (const x of hist) {
+        if (dir === 0) {
+            if (x > ext + amp) { dir = 1; ext = x; }
+            else if (x < ext - amp) { dir = -1; ext = x; }
+            else ext = x;
+        } else if (dir === 1) {
+            if (x > ext) ext = x;
+            else if (ext - x > amp) { rev++; dir = -1; ext = x; }
+        } else {
+            if (x < ext) ext = x;
+            else if (x - ext > amp) { rev++; dir = 1; ext = x; }
+        }
+    }
+    return rev;
+}
+
+const LINKS = [
+    [0,1],[1,2],[2,3],[3,4],
+    [0,5],[5,6],[6,7],[7,8],
+    [5,9],[9,10],[10,11],[11,12],
+    [9,13],[13,14],[14,15],[15,16],
+    [13,17],[17,18],[18,19],[19,20],
+    [0,17]
+];
+
+function flash(msg) { flashMsg = msg; flashUntil = performance.now() + 1500; }
+
+function onResults(res) {
+    const now = performance.now();
+    if (res.multiHandLandmarks && res.multiHandLandmarks.length > 0) {
+        const lm = res.multiHandLandmarks[0];
+        latest = lm;
+        lastSeen = now;
+
+        // --- 攥拳/张开检测：指尖到手腕的平均距离 / 手掌参考尺寸 ---
+        const wrist = lm[0], mid = lm[9];
+        const handSize = Math.hypot(wrist.x - mid.x, wrist.y - mid.y) + 1e-6;
+        let sum = 0;
+        for (const i of [8, 12, 16, 20]) sum += Math.hypot(wrist.x - lm[i].x, wrist.y - lm[i].y);
+        const ratio = sum / 4 / handSize;   // 拳 ≈ 0.8~1.1，张开 ≈ 1.5~1.9
+
+        // 连续映射：攥拳 0.15x → 张开 2.0x
+        const t = Math.min(1, Math.max(0, (ratio - 0.9) / 0.55));
+        targetScale = 0.15 + t * 1.85;
+
+        // --- 捏合检测（拇指-食指距离 / 手掌尺寸，带滞回）---
+        const pinchDist = Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y) / handSize;
+        const wasPinching = pinching;
+        if (!pinching && pinchDist < 0.38) pinching = true;
+        else if (pinching && pinchDist > 0.52) pinching = false;
+
+        // --- 捏合拖动：增量累加，松手后视角保持在当前位置 ---
+        if (pinching) {
+            const nx = 1 - lm[9].x, ny = lm[9].y;   // 镜像后的归一化手掌坐标
+            if (wasPinching) {
+                const dx = nx - prevNx, dy = ny - prevNy;
+                userYawTarget += dx * 3.2;   // 横向拖满一屏 ≈ 3.2 弧度
+                userTiltTarget = Math.max(-1.1, Math.min(1.1, userTiltTarget + dy * 2.4));
+                centerTX = Math.max(-cw * 0.3, Math.min(cw * 0.3, centerTX + dx * cw * 0.9));
+                centerTY = Math.max(-ch * 0.25, Math.min(ch * 0.25, centerTY + dy * ch * 0.9));
+            }
+            prevNx = nx; prevNy = ny;
+            xHist = [];   // 捏合期间不做摇晃检测，防止误切换
+        }
+
+        // --- 左右摇晃检测 ---
+        const palmX = (1 - lm[9].x) * cw;
+        const handPx = handSize * ch;
+        xHist.push({ x: palmX, t: now });
+        while (xHist.length && now - xHist[0].t > 900) xHist.shift();  // 保留最近 0.9 秒，更快响应
+        if (now - lastSwitch > 600) {
+            const rev = countReversals(xHist.map(p => p.x), Math.max(15, handPx * 0.25));
+            if (rev >= 2) {
+                lastSwitch = now;
+                xHist = [];
+                const next = (current + 1) % ANIMS.length;
+                setAnim(next);
+                flash('左右摇晃 → 已切换：' + ANIMS[next].name);
+            }
+        }
+    } else {
+        latest = null;
+        handSmoothed = null;
+        // 快速晃动时手部会短暂丢失，400ms 内保留状态，避免摇晃检测被打断
+        if (now - lastSeen > 400) {
+            xHist = [];
+            userYawTarget = 0; userTiltTarget = 0;
+            centerTX = 0; centerTY = 0;
+            pinching = false;
+        }
+        // 手离开画面后动画缓慢恢复默认大小
+        if (now - lastSeen > 800) targetScale = 1.0;
+    }
+}
+
+/* ================= 渲染 ================= */
+function drawVideoCover(w, h) {
+    const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+    if (!vw || !vh) return;
+    const sc = Math.max(w / vw, h / vh);
+    const dw = vw * sc, dh = vh * sc;
+    ctx.save();
+    ctx.globalAlpha = 0.55;
+    ctx.translate(w, 0); ctx.scale(-1, 1);   // 镜像
+    ctx.drawImage(videoEl, (w - dw) / 2, (h - dh) / 2, dw, dh);
+    ctx.restore();
+}
+
+function drawParticles(anim, dt, time, fade, w, h) {
+    const cx = w / 2 + centerOffX, cy = h * 0.46 + centerOffY;
+    const baseR = Math.min(w, h) * 0.30 * anim.fit * animScale;
+    const rot = time * anim.rotSpeed + userYaw;   // 自转 + 手掌控制的视角偏航
+    const cY = Math.cos(rot), sY = Math.sin(rot);
+    const tilt = anim.tilt + Math.max(-0.6, Math.min(0.6, userTilt));
+    const cT = Math.cos(tilt), sT = Math.sin(tilt);
+    const F = 3.4;
+    const pts = anim.pts;
+    const n = pts.length;
+    const px = new Float32Array(n), py = new Float32Array(n), pk = new Float32Array(n);
+
+    for (let i = 0; i < n; i++) {
+        const p = pts[i];
+        if (anim.frame) anim.frame(p, dt, time);
+        const x = p.x * cY + p.z * sY;           // 绕 Y 轴自转
+        const z = -p.x * sY + p.z * cY;
+        const y2 = p.y * cT - z * sT;            // 固定倾角
+        const z2 = p.y * sT + z * cT;
+        const k = Math.min(3, F / (F + z2));     // 透视投影
+        px[i] = cx + x * baseR * k;
+        py[i] = cy + y2 * baseR * k;
+        pk[i] = k;
+    }
+
+    ctx.globalCompositeOperation = 'lighter';
+
+    // 星座连线
+    if (anim.lines) {
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = anim.name === '星图' ? 'rgba(205, 225, 255, 0.38)' : 'rgba(130, 215, 240, 0.20)';
+        ctx.beginPath();
+        for (const [i, j] of anim.lines) {
+            ctx.moveTo(px[i], py[i]);
+            ctx.lineTo(px[j], py[j]);
+        }
+        ctx.stroke();
+    }
+
+    // 粒子本体：圆形光晕 + 圆形核心（径向渐变精灵），发光更强
+    const sizeBoost = 0.5 + 0.9 * animScale;
+    for (let i = 0; i < n; i++) {
+        const p = pts[i], k = pk[i];
+        const tw = 0.55 + 0.45 * Math.sin(time * 2.4 + p.tw);   // 闪烁
+        let size, a, nodeGlow = false;
+        if (anim.name === '星图' && !p.star) {
+            size = (0.8 + p.s * 1.6) * k * sizeBoost;            // 银河尘埃/背景暗星
+            a = (0.22 + 0.42 * tw) * fade;
+        } else if (anim.name === '星图') {
+            size = (1.8 + p.s * 1.8) * k * sizeBoost;            // 星图节点：更大更亮
+            a = (0.85 + 0.15 * tw) * fade;
+            nodeGlow = true;
+        } else if (anim.name === '星座') {
+            size = (1.4 + p.s * 2.4) * k * (p.star ? 1.6 : 1) * sizeBoost;
+            a = (0.65 + 0.35 * tw) * fade;
+        } else {
+            size = (0.9 + p.s * 1.7) * k * sizeBoost;
+            a = (0.3 + 0.7 * tw) * fade;
+        }
+        const x0 = px[i], y0 = py[i];
+        if (nodeGlow) {
+            // 节点：双层柔和圆形扩散（大范围光雾向外渐隐）+ 中心亮点
+            const ds = size * 14;
+            ctx.globalAlpha = a * 0.4;
+            ctx.drawImage(diffuseSprite, x0 - ds / 2, y0 - ds / 2, ds, ds);
+            const ds2 = size * 7;
+            ctx.globalAlpha = a * 0.35;
+            ctx.drawImage(diffuseSprite, x0 - ds2 / 2, y0 - ds2 / 2, ds2, ds2);
+            ctx.globalAlpha = a;
+            ctx.drawImage(glowSprite, x0 - size, y0 - size, size * 2, size * 2);
+        } else {
+            // 外圈圆形光晕（更大更柔）
+            const gs = size * 6;
+            ctx.globalAlpha = a * 0.3;
+            ctx.drawImage(glowSprite, x0 - gs / 2, y0 - gs / 2, gs, gs);
+            // 柔和圆形核心
+            ctx.globalAlpha = a * 0.9;
+            ctx.drawImage(glowSprite, x0 - size, y0 - size, size * 2, size * 2);
+        }
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawHand(w, h) {
+    if (!latest) { handSmoothed = null; return; }
+    const alpha = 0.5;
+    if (!handSmoothed) {
+        handSmoothed = latest.map(p => ({ x: (1 - p.x) * w, y: p.y * h }));
+    } else {
+        latest.forEach((p, i) => {
+            handSmoothed[i].x += ((1 - p.x) * w - handSmoothed[i].x) * alpha;
+            handSmoothed[i].y += (p.y * h - handSmoothed[i].y) * alpha;
+        });
+    }
+    const pts = handSmoothed;
+
+    // 连线（青色）
+    ctx.strokeStyle = 'rgba(100, 225, 240, 0.85)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (const [i, j] of LINKS) {
+        ctx.moveTo(pts[i].x, pts[i].y);
+        ctx.lineTo(pts[j].x, pts[j].y);
+    }
+    ctx.stroke();
+
+    // 关节点（白色）
+    ctx.fillStyle = '#fff';
+    for (let i = 0; i < pts.length; i++) {
+        const r = [4, 8, 12, 16, 20].includes(i) ? 3.6 : 2.6;
+        ctx.beginPath(); ctx.arc(pts[i].x, pts[i].y, r, 0, TAU); ctx.fill();
+    }
+
+    // 食指指尖高亮标记
+    const tip = pts[8];
+    ctx.beginPath(); ctx.arc(tip.x, tip.y, 7, 0, TAU);
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(tip.x, tip.y, 3.5, 0, TAU);
+    ctx.fillStyle = '#ffb340'; ctx.fill();
+}
+
+function updateStatus(now) {
+    if (now < flashUntil) { statusEl.textContent = flashMsg; return; }
+    if (!camReady) { statusEl.textContent = '正在初始化摄像头...'; return; }
+    if (!latest) {
+        statusEl.innerHTML = '未检测到手，请将手掌对准摄像头' +
+            '<br><span class="sub">攥拳缩小 · 张开放大 · 捏合拖动移动视角 · 左右摇晃切换动画</span>';
+        return;
+    }
+    const animName = ANIMS[current].name;
+    const scalePct = Math.round(animScale * 100);
+    statusEl.innerHTML = `当前：${animName}（${scalePct}%）` +
+        '<br><span class="sub">攥拳缩小 · 张开放大 · 捏合拖动移动视角 · 左右摇晃切换动画</span>';
+}
+
+/* ================= 主循环 ================= */
+let lastT = performance.now();
+function loop(now) {
+    requestAnimationFrame(loop);
+    const dt = Math.min(0.05, (now - lastT) / 1000);
+    lastT = now;
+    const time = now / 1000;
+
+    animScale += (targetScale - animScale) * Math.min(1, dt * 4);
+    userYaw += (userYawTarget - userYaw) * Math.min(1, dt * 8);
+    userTilt += (userTiltTarget - userTilt) * Math.min(1, dt * 8);
+    centerOffX += (centerTX - centerOffX) * Math.min(1, dt * 8);
+    centerOffY += (centerTY - centerOffY) * Math.min(1, dt * 8);
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, cw, ch);
+    drawVideoCover(cw, ch);
+
+    const anim = ANIMS[current];
+    const fade = Math.min(1, (now - switchTime) / 700);   // 切换后淡入
+    drawParticles(anim, dt, time, fade, cw, ch);
+    drawHand(cw, ch);
+    updateStatus(now);
+}
+
+/* ================= 启动 ================= */
+setAnim(0);   // 默认第一个：球体
+requestAnimationFrame(loop);
+
+const hands = new Hands({
+    locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+});
+hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 0,          // 轻量模型：推理更快，快速晃动时不易丢手
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.5
+});
+hands.onResults(onResults);
+
+const camera = new Camera(videoEl, {
+    onFrame: async () => { await hands.send({ image: videoEl }); },
+    width: 1280,
+    height: 720
+});
+camera.start()
+    .then(() => { camReady = true; })
+    .catch(err => { statusEl.textContent = '摄像头启动失败：' + err.message; });
+</script>
+
+</body>
+</html>
