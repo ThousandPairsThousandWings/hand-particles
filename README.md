@@ -1,6 +1,7 @@
 # 手势粒子动画 - Hand Particles
 
 一个纯浏览器端的摄像头手势交互项目：打开网页、授权摄像头，即可用手势操控屏幕上的 3D 粒子动画。单 HTML 文件、零构建、本地运行。
+在线尝试：https://thousandpairsthousandwings.github.io/hand-particles/
 
 ![技术栈](https://img.shields.io/badge/HTML5-Canvas_2D-blue) ![依赖](https://img.shields.io/badge/MediaPipe-Hands-green) ![许可](https://img.shields.io/badge/%E6%9E%84%E5%BB%BA-%E6%97%A0-lightgrey)
 
